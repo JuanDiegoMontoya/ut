@@ -278,7 +278,6 @@ uint64_t SubmitAndGetTime(const std::function<void(VkCommandBuffer)>& fn)
   return queryResults[1] - queryResults[0];
 }
 
-#include <iostream>
 int main()
 {
   Init();
