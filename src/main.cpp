@@ -10,6 +10,13 @@
 #include <optional>
 #include <fstream>
 #include <cassert>
+#include <cstdint>
+
+struct BufferAllocation
+{
+  VkBuffer buffer;
+  VmaAllocation allocation;
+};
 
 void VK_CHECK(VkResult err)
 {
@@ -29,6 +36,10 @@ uint32_t gQueueFamilyIndex;
 VmaAllocator gAllocator;
 std::stack<std::function<void()>> gDeletionStack;
 VkPipeline gPipeline;
+VkPipelineLayout gPipelineLayout;
+VkDescriptorPool gDescriptorPool;
+VkDescriptorSetLayout gDescriptorSetLayout;
+VkDescriptorSet gDescriptorSet;
 VkCommandPool gCommandPool;
 VkCommandBuffer gCommandBuffer;
 VkFence gFence;
@@ -127,18 +138,19 @@ void InitVulkan()
   gDeletionStack.push([=] { vmaDestroyAllocator(gAllocator); });
 }
 
-void InitPipeline()
+void InitDescriptors()
 {
-  auto shaderModule = LoadShaderModule("shaders/test.comp.spv").value_or(VkShaderModule{});
-  gDeletionStack.push([=] { vkDestroyShaderModule(gDevice, shaderModule, nullptr); });
-
-  auto shaderStageInfo = VkPipelineShaderStageCreateInfo
+  auto poolSize = VkDescriptorPoolSize{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 10 };
+  auto descriptorPoolInfo = VkDescriptorPoolCreateInfo
   {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-    .module = shaderModule,
-    .pName = "main"
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .maxSets = 1,
+    .poolSizeCount = 1,
+    .pPoolSizes = &poolSize
   };
+  VK_CHECK(vkCreateDescriptorPool(gDevice, &descriptorPoolInfo, nullptr, &gDescriptorPool));
+  gDeletionStack.push([=] {vkDestroyDescriptorPool(gDevice, gDescriptorPool, nullptr); });
+
   auto descriptorSetLayoutBinding = VkDescriptorSetLayoutBinding
   {
     .binding = 0,
@@ -152,25 +164,47 @@ void InitPipeline()
     .bindingCount = 1,
     .pBindings = &descriptorSetLayoutBinding
   };
-  auto descriptorSetLayout = VkDescriptorSetLayout{};
-  VK_CHECK(vkCreateDescriptorSetLayout(gDevice, &descriptorSetLayoutInfo, nullptr, &descriptorSetLayout));
-  gDeletionStack.push([=] { vkDestroyDescriptorSetLayout(gDevice, descriptorSetLayout, nullptr); });
+  VK_CHECK(vkCreateDescriptorSetLayout(gDevice, &descriptorSetLayoutInfo, nullptr, &gDescriptorSetLayout));
+  gDeletionStack.push([=] { vkDestroyDescriptorSetLayout(gDevice, gDescriptorSetLayout, nullptr); });
+
+  auto descriptorSetAllocInfo = VkDescriptorSetAllocateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+    .descriptorPool = gDescriptorPool,
+    .descriptorSetCount = 1,
+    .pSetLayouts = &gDescriptorSetLayout
+  };
+  VK_CHECK(vkAllocateDescriptorSets(gDevice, &descriptorSetAllocInfo, &gDescriptorSet));
+  //gDeletionStack.push([=] { VK_CHECK(vkFreeDescriptorSets(gDevice, gDescriptorPool, 1, &gDescriptorSet)); });
+}
+
+void InitPipeline()
+{
+  auto shaderModule = LoadShaderModule("shaders/test.comp.spv").value_or(VkShaderModule{});
+  gDeletionStack.push([=] { vkDestroyShaderModule(gDevice, shaderModule, nullptr); });
+
+  auto shaderStageInfo = VkPipelineShaderStageCreateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+    .module = shaderModule,
+    .pName = "main"
+  };
 
   auto pipelineLayoutInfo = VkPipelineLayoutCreateInfo
   {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
     .setLayoutCount = 1,
-    .pSetLayouts = &descriptorSetLayout,
+    .pSetLayouts = &gDescriptorSetLayout,
   };
-  auto pipelineLayout = VkPipelineLayout{};
-  VK_CHECK(vkCreatePipelineLayout(gDevice, &pipelineLayoutInfo, nullptr, &pipelineLayout));
-  gDeletionStack.push([=] { vkDestroyPipelineLayout(gDevice, pipelineLayout, nullptr); });
+  VK_CHECK(vkCreatePipelineLayout(gDevice, &pipelineLayoutInfo, nullptr, &gPipelineLayout));
+  gDeletionStack.push([=] { vkDestroyPipelineLayout(gDevice, gPipelineLayout, nullptr); });
 
   auto pipelineInfo = VkComputePipelineCreateInfo
   {
     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
     .stage = shaderStageInfo,
-    .layout = pipelineLayout,
+    .layout = gPipelineLayout,
   };
   VK_CHECK(vkCreateComputePipelines(gDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &gPipeline));
   gDeletionStack.push([=] { vkDestroyPipeline(gDevice, gPipeline, nullptr); });
@@ -223,6 +257,7 @@ void InitQueryPool()
 void Init()
 {
   InitVulkan();
+  InitDescriptors();
   InitPipeline();
   InitCommandBuffers();
   InitSync();
@@ -275,15 +310,90 @@ uint64_t SubmitAndGetTime(const std::function<void(VkCommandBuffer)>& fn)
     sizeof(queryResults), queryResults, sizeof(uint64_t),
     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
 
+  vkResetQueryPool(gDevice, gQueryPool, 0, 2);
+
   return queryResults[1] - queryResults[0];
+}
+
+BufferAllocation CreateBuffer(size_t sizeBytes, VkBufferUsageFlags usage, VmaAllocationCreateFlags allocationFlags = 0, VkMemoryPropertyFlags memoryProperties = 0)
+{
+  auto bufferInfo = VkBufferCreateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = sizeBytes,
+    .usage = usage
+  };
+
+  auto allocInfo = VmaAllocationCreateInfo
+  {
+    .flags = allocationFlags,
+    .usage = VMA_MEMORY_USAGE_AUTO,
+    .requiredFlags = memoryProperties
+  };
+
+  BufferAllocation buffer;
+  VK_CHECK(vmaCreateBuffer(gAllocator, &bufferInfo, &allocInfo, &buffer.buffer, &buffer.allocation, nullptr));
+  return buffer;
 }
 
 int main()
 {
   Init();
 
-  auto result = SubmitAndGetTime([](VkCommandBuffer) {}); // do nothing
+  const size_t bufferSize = 1024 * sizeof(uint32_t);
+
+  auto buffer = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, buffer.buffer, buffer.allocation); });
+  auto hostBuffer = CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // for mapping
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, hostBuffer.buffer, hostBuffer.allocation); });
+
+  // update descriptor set with our buffer
+  auto descriptorBufferInfo = VkDescriptorBufferInfo
+  {
+    .buffer = buffer.buffer,
+    .offset = 0,
+    .range = bufferSize
+  };
+  auto descriptorWrite = VkWriteDescriptorSet
+  {
+    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+    .dstSet = gDescriptorSet,
+    .dstBinding = 0,
+    .dstArrayElement = 0,
+    .descriptorCount = 1,
+    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    .pBufferInfo = &descriptorBufferInfo
+  };
+  vkUpdateDescriptorSets(gDevice, 1, &descriptorWrite, 0, nullptr);
+
+  auto result = SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
+    {
+      uint32_t dispatchSize = 1024 / 64;
+      vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipelineLayout, 0, 1, &gDescriptorSet, 0, nullptr);
+      vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipeline);
+      vkCmdDispatch(cmdBuf, dispatchSize, 1, 1);
+    }); // do nothing
+  
   std::cout << "Event time: " << gTimestampPeriod << " * " << result << " ns\n";
+
+  SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
+    {
+      auto region = VkBufferCopy
+      {
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = bufferSize
+      };
+      vkCmdCopyBuffer(cmdBuf, buffer.buffer, hostBuffer.buffer, 1, &region);
+    });
+
+  uint32_t* pData;
+  VK_CHECK(vmaMapMemory(gAllocator, hostBuffer.allocation, reinterpret_cast<void**>(&pData)));
+  for (int i = 0; i < 1024; i++)
+  {
+    std::cout << pData[i] << ' ';
+  }
+  vmaUnmapMemory(gAllocator, hostBuffer.allocation);
 
   Deinit();
   return 0;
