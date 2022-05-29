@@ -51,6 +51,7 @@ set(source_files
 	src/main.cpp
 )
 add_executable(vulkan_compute ${source_files})
+
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT vulkan_compute)
 target_include_directories(vulkan_compute PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vulkan_compute vk-bootstrap VulkanMemoryAllocator Vulkan::Vulkan)

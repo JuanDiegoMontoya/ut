@@ -1,14 +1,34 @@
 #version 450
 
-layout(set = 0, binding = 0, std430) writeonly restrict buffer SSBO0
-{
-    uint data[];
-}buf;
+#extension GL_EXT_scalar_block_layout : require
 
-layout(local_size_x = 64) in;
+struct packed_vec3 { float x, y, z; };
+
+layout(set = 0, binding = 0, std430) readonly restrict buffer SSBO0
+{
+    //vec3 data[];
+    packed_vec3 data[];
+}A;
+
+layout(set = 0, binding = 1, std430) readonly restrict buffer SSBO1
+{
+    //vec3 data[];
+    packed_vec3 data[];
+}B;
+
+layout(set = 0, binding = 2, std430) writeonly restrict buffer SSBO2
+{
+    //vec3 data[];
+    packed_vec3 data[];
+}C;
+
+layout(local_size_x = 128) in;
 void main()
 {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= buf.data.length()) return;
-    buf.data[i] = i;
+    if (i >= A.data.length()) return;
+    //C.data[i] = A.data[i] + B.data[i];
+    packed_vec3 a = A.data[i];
+    packed_vec3 b = B.data[i];
+    C.data[i] = packed_vec3(a.x + b.x, a.y + b.y, a.z + b.z);
 }

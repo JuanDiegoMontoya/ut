@@ -11,6 +11,17 @@
 #include <fstream>
 #include <cassert>
 #include <cstdint>
+#include <sstream>
+#include <bit>
+#include <format>
+#include <span>
+#include <vector>
+
+constexpr bool DISPLAY_OUTPUT = true;
+constexpr size_t DISPLAY_OUTPUT_COUNT = 32;
+constexpr size_t NUM_ELEMENTS = 1024 * 1024 * 100;
+constexpr int WORKGROUP_SIZE_X = 128;
+constexpr int NUM_ITERATIONS = 30;
 
 struct BufferAllocation
 {
@@ -98,7 +109,8 @@ void InitVulkan()
 
   auto requiredFeatures = VkPhysicalDeviceVulkan12Features
   {
-    .hostQueryReset = true
+    .scalarBlockLayout = true,
+    .hostQueryReset = true,
   };
 
   vkb::PhysicalDevice vkbPhysicalDevice = selector
@@ -151,18 +163,21 @@ void InitDescriptors()
   VK_CHECK(vkCreateDescriptorPool(gDevice, &descriptorPoolInfo, nullptr, &gDescriptorPool));
   gDeletionStack.push([=] {vkDestroyDescriptorPool(gDevice, gDescriptorPool, nullptr); });
 
-  auto descriptorSetLayoutBinding = VkDescriptorSetLayoutBinding
+  auto descriptorSetLayoutABinding = VkDescriptorSetLayoutBinding
   {
     .binding = 0,
     .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
     .descriptorCount = 1,
     .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
   };
+  auto descriptorSetLayoutBBinding = VkDescriptorSetLayoutBinding { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+  auto descriptorSetLayoutCBinding = VkDescriptorSetLayoutBinding { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+  VkDescriptorSetLayoutBinding bindings[] = { descriptorSetLayoutABinding, descriptorSetLayoutBBinding, descriptorSetLayoutCBinding };
   auto descriptorSetLayoutInfo = VkDescriptorSetLayoutCreateInfo
   {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-    .bindingCount = 1,
-    .pBindings = &descriptorSetLayoutBinding
+    .bindingCount = 3,
+    .pBindings = bindings
   };
   VK_CHECK(vkCreateDescriptorSetLayout(gDevice, &descriptorSetLayoutInfo, nullptr, &gDescriptorSetLayout));
   gDeletionStack.push([=] { vkDestroyDescriptorSetLayout(gDevice, gDescriptorSetLayout, nullptr); });
@@ -336,65 +351,107 @@ BufferAllocation CreateBuffer(size_t sizeBytes, VkBufferUsageFlags usage, VmaAll
   return buffer;
 }
 
+void BindStorageBuffers(VkDescriptorSet descriptorSet, std::span<const BufferAllocation> buffers)
+{
+  std::vector<VkDescriptorBufferInfo> infos;
+  infos.resize(buffers.size());
+
+  for (size_t i = 0; i < buffers.size(); i++)
+  {
+    infos[i] = VkDescriptorBufferInfo
+    {
+      .buffer = buffers[i].buffer,
+      .offset = 0,
+      .range = VK_WHOLE_SIZE
+    };
+  }
+
+  auto descriptorWrite = VkWriteDescriptorSet
+  {
+    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+    .dstSet = descriptorSet,
+    .dstBinding = 0,
+    .dstArrayElement = 0,
+    .descriptorCount = static_cast<uint32_t>(infos.size()),
+    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    .pBufferInfo = infos.data()
+  };
+
+  vkUpdateDescriptorSets(gDevice, 1, &descriptorWrite, 0, nullptr);
+}
+
 int main()
 {
   Init();
 
-  const size_t bufferSize = 1024 * sizeof(uint32_t);
+  const size_t bufferSize = NUM_ELEMENTS * sizeof(float) * 4;
 
-  auto buffer = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, buffer.buffer, buffer.allocation); });
-  auto hostBuffer = CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // for mapping
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, hostBuffer.buffer, hostBuffer.allocation); });
-
-  // update descriptor set with our buffer
-  auto descriptorBufferInfo = VkDescriptorBufferInfo
-  {
-    .buffer = buffer.buffer,
-    .offset = 0,
-    .range = bufferSize
-  };
-  auto descriptorWrite = VkWriteDescriptorSet
-  {
-    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-    .dstSet = gDescriptorSet,
-    .dstBinding = 0,
-    .dstArrayElement = 0,
-    .descriptorCount = 1,
-    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    .pBufferInfo = &descriptorBufferInfo
-  };
-  vkUpdateDescriptorSets(gDevice, 1, &descriptorWrite, 0, nullptr);
-
-  auto result = SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
-    {
-      uint32_t dispatchSize = 1024 / 64;
-      vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipelineLayout, 0, 1, &gDescriptorSet, 0, nullptr);
-      vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipeline);
-      vkCmdDispatch(cmdBuf, dispatchSize, 1, 1);
-    }); // do nothing
+  auto bufferA = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferA.buffer, bufferA.allocation); });
+  auto bufferB = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferB.buffer, bufferB.allocation); });
+  auto bufferC = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferC.buffer, bufferC.allocation); });
+  auto hostBufferC = CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // for mapping
+  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, hostBufferC.buffer, hostBufferC.allocation); });
   
-  std::cout << "Event time: " << gTimestampPeriod << " * " << result << " ns\n";
-
   SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
     {
-      auto region = VkBufferCopy
-      {
-        .srcOffset = 0,
-        .dstOffset = 0,
-        .size = bufferSize
-      };
-      vkCmdCopyBuffer(cmdBuf, buffer.buffer, hostBuffer.buffer, 1, &region);
+      vkCmdFillBuffer(cmdBuf, bufferA.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(1.0f));
+      vkCmdFillBuffer(cmdBuf, bufferB.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(2.0f));
     });
 
-  uint32_t* pData;
-  VK_CHECK(vmaMapMemory(gAllocator, hostBuffer.allocation, reinterpret_cast<void**>(&pData)));
-  for (int i = 0; i < 1024; i++)
-  {
-    std::cout << pData[i] << ' ';
-  }
-  vmaUnmapMemory(gAllocator, hostBuffer.allocation);
+  // update descriptor set with our buffer(s)
+  BindStorageBuffers(gDescriptorSet, {{ bufferA, bufferB, bufferC }});
 
+  std::cout << "Elements: " << NUM_ELEMENTS << '\n';
+  uint64_t accumulatedTime = 0;
+  for (int i = 0; i < NUM_ITERATIONS; i++)
+  {
+    auto result = SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
+      {
+        uint32_t dispatchSize = (NUM_ELEMENTS + WORKGROUP_SIZE_X - 1) / WORKGROUP_SIZE_X;
+        vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipelineLayout, 0, 1, &gDescriptorSet, 0, nullptr);
+        vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipeline);
+        vkCmdDispatch(cmdBuf, dispatchSize, 1, 1);
+      });
+
+    accumulatedTime += result;
+    //std::cout << "Event time: " << gTimestampPeriod << " * " << result << " ns (" << ((double)gTimestampPeriod * result) / 1'000'000 << " ms)\n";
+    std::cout << std::format("Event time: {} * {} ns ({} ms)\n", gTimestampPeriod, result, ((double)gTimestampPeriod * result) / 1'000'000);
+
+    if constexpr (DISPLAY_OUTPUT)
+    {
+      SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
+        {
+          auto region = VkBufferCopy
+          {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = bufferSize
+          };
+          vkCmdCopyBuffer(cmdBuf, bufferC.buffer, hostBufferC.buffer, 1, &region);
+        });
+
+      float* pData;
+      VK_CHECK(vmaMapMemory(gAllocator, hostBufferC.allocation, reinterpret_cast<void**>(&pData)));
+
+      // display the first 32 results
+      std::stringstream o;
+      o << "First " << DISPLAY_OUTPUT_COUNT << " elements: ";
+      for (int j = 0; j < DISPLAY_OUTPUT_COUNT; j++)
+      {
+        o << pData[j] << ' ';
+      }
+      std::cout << o.str() << '\n';
+
+      vmaUnmapMemory(gAllocator, hostBufferC.allocation);
+    }
+  }
+
+  accumulatedTime /= NUM_ITERATIONS;
+  std::cout << std::format("Average time ({} iterations): {} * {} ns ({} ms)\n", NUM_ITERATIONS, gTimestampPeriod, accumulatedTime, ((double)gTimestampPeriod * accumulatedTime) / 1'000'000);
+  
   Deinit();
   return 0;
 }
