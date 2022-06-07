@@ -4,40 +4,55 @@
 #include <vk_mem_alloc.h>
 
 #include <stack>
-#include <functional>
+#include <functional> // std::function
 #include <iostream>
+#include <sstream>
 #include <string_view>
 #include <optional>
 #include <fstream>
 #include <cassert>
 #include <cstdint>
-#include <sstream>
-#include <bit>
-#include <format>
+#include <bit>    // std::bit_cast
+#include <format> // std::format
 #include <span>
 #include <vector>
+#include <thread> // std::this_thread::sleep_for
+#include <chrono> // duration
 
+/////////////////////////////// Constants
 constexpr bool DISPLAY_OUTPUT = true;
 constexpr size_t DISPLAY_OUTPUT_COUNT = 32;
 constexpr size_t NUM_ELEMENTS = 1024 * 1024 * 100;
 constexpr int WORKGROUP_SIZE_X = 128;
-constexpr int NUM_ITERATIONS = 30;
+constexpr int NUM_ITERATIONS = 50;
 
+constexpr int ITERATION_DELAY_MS = 0;
+constexpr int TEST_DELAY_MS = 300;
+
+/////////////////////////////// Types
 struct BufferAllocation
 {
   VkBuffer buffer;
   VmaAllocation allocation;
 };
 
-void VK_CHECK(VkResult err)
+struct PipelineInfo
 {
-  if (err)
-  {
-    std::cout << "Vulkan error: " << err << '\n';
-    std::abort();
-  }
-}
+  VkPipeline pipeline;
+  VkPipelineLayout layout;
+};
 
+struct TestInfo
+{
+  std::string shaderPath;
+
+  // Alignment of one vector element.
+  // For example, a vec3 or vec4 in std430 would have elementAlignment of 4 floats, 
+  // while a vec3 or packed_vec3 in scalar would have elementAlignment of 3 floats.
+  size_t elementAlignment;
+};
+
+/////////////////////////////// Globals
 VkInstance gInstance;
 VkDebugUtilsMessengerEXT gDebugMessenger;
 VkDevice gDevice;
@@ -46,8 +61,6 @@ VkQueue gQueue;
 uint32_t gQueueFamilyIndex;
 VmaAllocator gAllocator;
 std::stack<std::function<void()>> gDeletionStack;
-VkPipeline gPipeline;
-VkPipelineLayout gPipelineLayout;
 VkDescriptorPool gDescriptorPool;
 VkDescriptorSetLayout gDescriptorSetLayout;
 VkDescriptorSet gDescriptorSet;
@@ -56,6 +69,16 @@ VkCommandBuffer gCommandBuffer;
 VkFence gFence;
 VkQueryPool gQueryPool;
 float gTimestampPeriod;
+
+/////////////////////////////// Functions
+void VK_CHECK(VkResult err)
+{
+  if (err)
+  {
+    std::cout << "Vulkan error: " << err << '\n';
+    std::abort();
+  }
+}
 
 std::optional<VkShaderModule> LoadShaderModule(std::string_view filePath)
 {
@@ -193,38 +216,6 @@ void InitDescriptors()
   //gDeletionStack.push([=] { VK_CHECK(vkFreeDescriptorSets(gDevice, gDescriptorPool, 1, &gDescriptorSet)); });
 }
 
-void InitPipeline()
-{
-  auto shaderModule = LoadShaderModule("shaders/test.comp.spv").value_or(VkShaderModule{});
-  gDeletionStack.push([=] { vkDestroyShaderModule(gDevice, shaderModule, nullptr); });
-
-  auto shaderStageInfo = VkPipelineShaderStageCreateInfo
-  {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-    .module = shaderModule,
-    .pName = "main"
-  };
-
-  auto pipelineLayoutInfo = VkPipelineLayoutCreateInfo
-  {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-    .setLayoutCount = 1,
-    .pSetLayouts = &gDescriptorSetLayout,
-  };
-  VK_CHECK(vkCreatePipelineLayout(gDevice, &pipelineLayoutInfo, nullptr, &gPipelineLayout));
-  gDeletionStack.push([=] { vkDestroyPipelineLayout(gDevice, gPipelineLayout, nullptr); });
-
-  auto pipelineInfo = VkComputePipelineCreateInfo
-  {
-    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-    .stage = shaderStageInfo,
-    .layout = gPipelineLayout,
-  };
-  VK_CHECK(vkCreateComputePipelines(gDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &gPipeline));
-  gDeletionStack.push([=] { vkDestroyPipeline(gDevice, gPipeline, nullptr); });
-}
-
 void InitCommandBuffers()
 {
   auto poolInfo = VkCommandPoolCreateInfo
@@ -273,7 +264,6 @@ void Init()
 {
   InitVulkan();
   InitDescriptors();
-  InitPipeline();
   InitCommandBuffers();
   InitSync();
   InitQueryPool();
@@ -287,6 +277,42 @@ void Deinit()
     fn();
     gDeletionStack.pop();
   }
+}
+
+[[nodiscard]] PipelineInfo CreatePipeline(std::string_view shaderPath)
+{
+  auto shaderModule = LoadShaderModule(shaderPath.data()).value_or(VkShaderModule{});
+  gDeletionStack.push([=] { vkDestroyShaderModule(gDevice, shaderModule, nullptr); });
+
+  auto shaderStageInfo = VkPipelineShaderStageCreateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+    .module = shaderModule,
+    .pName = "main"
+  };
+
+  auto pipelineLayoutInfo = VkPipelineLayoutCreateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    .setLayoutCount = 1,
+    .pSetLayouts = &gDescriptorSetLayout,
+  };
+  VkPipelineLayout layout;
+  VK_CHECK(vkCreatePipelineLayout(gDevice, &pipelineLayoutInfo, nullptr, &layout));
+  gDeletionStack.push([=] { vkDestroyPipelineLayout(gDevice, layout, nullptr); });
+
+  auto pipelineInfo = VkComputePipelineCreateInfo
+  {
+    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+    .stage = shaderStageInfo,
+    .layout = layout,
+  };
+  VkPipeline pipeline;
+  VK_CHECK(vkCreateComputePipelines(gDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline));
+  gDeletionStack.push([=] { vkDestroyPipeline(gDevice, pipeline, nullptr); });
+
+  return { pipeline, layout };
 }
 
 uint64_t SubmitAndGetTime(const std::function<void(VkCommandBuffer)>& fn)
@@ -380,77 +406,133 @@ void BindStorageBuffers(VkDescriptorSet descriptorSet, std::span<const BufferAll
   vkUpdateDescriptorSets(gDevice, 1, &descriptorWrite, 0, nullptr);
 }
 
-int main()
+void CopyBuffer(BufferAllocation src, BufferAllocation dst, VkDeviceSize size)
 {
-  Init();
+  auto region = VkBufferCopy
+  {
+    .srcOffset = 0,
+    .dstOffset = 0,
+    .size = size
+  };
+  vkCmdCopyBuffer(gCommandBuffer, src.buffer, dst.buffer, 1, &region);
+}
 
-  const size_t bufferSize = NUM_ELEMENTS * sizeof(float) * 4;
+void DoTest(const TestInfo& test)
+{
+  auto [pipeline, pipelineLayout] = CreatePipeline(test.shaderPath);
+  std::stack<std::function<void()>> localDeletionStack;
 
-  auto bufferA = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferA.buffer, bufferA.allocation); });
-  auto bufferB = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferB.buffer, bufferB.allocation); });
-  auto bufferC = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, bufferC.buffer, bufferC.allocation); });
-  auto hostBufferC = CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // for mapping
-  gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, hostBufferC.buffer, hostBufferC.allocation); });
-  
+  const size_t bufferSize = NUM_ELEMENTS * sizeof(float) * test.elementAlignment;
+
+  auto inBufferA = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  localDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, inBufferA.buffer, inBufferA.allocation); });
+  auto inBufferB = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  localDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, inBufferB.buffer, inBufferB.allocation); });
+  auto outBuffer = CreateBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  localDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, outBuffer.buffer, outBuffer.allocation); });
+  //auto outBufferHost = CreateBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT); // for mapping
+  //gDeletionStack.push([=] { vmaDestroyBuffer(gAllocator, outBufferHost.buffer, outBufferHost.allocation); });
+
+  // fill the input buffers with some test data
   SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
     {
-      vkCmdFillBuffer(cmdBuf, bufferA.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(1.0f));
-      vkCmdFillBuffer(cmdBuf, bufferB.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(2.0f));
+      vkCmdFillBuffer(cmdBuf, inBufferA.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(1.0f));
+      vkCmdFillBuffer(cmdBuf, inBufferB.buffer, 0, VK_WHOLE_SIZE, std::bit_cast<uint32_t>(2.0f));
     });
 
   // update descriptor set with our buffer(s)
-  BindStorageBuffers(gDescriptorSet, {{ bufferA, bufferB, bufferC }});
+  BindStorageBuffers(gDescriptorSet, { { inBufferA, inBufferB, outBuffer } });
 
-  std::cout << "Elements: " << NUM_ELEMENTS << '\n';
+  auto iterationTimes = std::vector<double>(NUM_ITERATIONS, 0);
   uint64_t accumulatedTime = 0;
   for (int i = 0; i < NUM_ITERATIONS; i++)
   {
     auto result = SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
       {
         uint32_t dispatchSize = (NUM_ELEMENTS + WORKGROUP_SIZE_X - 1) / WORKGROUP_SIZE_X;
-        vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipelineLayout, 0, 1, &gDescriptorSet, 0, nullptr);
-        vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, gPipeline);
+        vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &gDescriptorSet, 0, nullptr);
+        vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdDispatch(cmdBuf, dispatchSize, 1, 1);
       });
 
+    double resultMs = (double)gTimestampPeriod * result / 1'000'000.0;
+    iterationTimes[i] = resultMs;
     accumulatedTime += result;
-    //std::cout << "Event time: " << gTimestampPeriod << " * " << result << " ns (" << ((double)gTimestampPeriod * result) / 1'000'000 << " ms)\n";
-    std::cout << std::format("Event time: {} * {} ns ({} ms)\n", gTimestampPeriod, result, ((double)gTimestampPeriod * result) / 1'000'000);
+    //std::cout << std::format("Event time: {} * {} ns ({} ms)\n", gTimestampPeriod, result, resultMs);
 
-    if constexpr (DISPLAY_OUTPUT)
+    if (i < NUM_ITERATIONS - 1)
     {
-      SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
-        {
-          auto region = VkBufferCopy
-          {
-            .srcOffset = 0,
-            .dstOffset = 0,
-            .size = bufferSize
-          };
-          vkCmdCopyBuffer(cmdBuf, bufferC.buffer, hostBufferC.buffer, 1, &region);
-        });
-
-      float* pData;
-      VK_CHECK(vmaMapMemory(gAllocator, hostBufferC.allocation, reinterpret_cast<void**>(&pData)));
-
-      // display the first 32 results
-      std::stringstream o;
-      o << "First " << DISPLAY_OUTPUT_COUNT << " elements: ";
-      for (int j = 0; j < DISPLAY_OUTPUT_COUNT; j++)
-      {
-        o << pData[j] << ' ';
-      }
-      std::cout << o.str() << '\n';
-
-      vmaUnmapMemory(gAllocator, hostBufferC.allocation);
+      std::this_thread::sleep_for(std::chrono::milliseconds{ ITERATION_DELAY_MS });
     }
+
+    //if constexpr (DISPLAY_OUTPUT)
+    //{
+    //  SubmitAndGetTime([=](VkCommandBuffer cmdBuf)
+    //    {
+    //      CopyBuffer(outBuffer, outBufferHost, bufferSize);
+    //    });
+
+    //  float* pData;
+    //  VK_CHECK(vmaMapMemory(gAllocator, outBufferHost.allocation, reinterpret_cast<void**>(&pData)));
+
+    //  // display the first 32 results
+    //  std::stringstream o;
+    //  o << "First " << DISPLAY_OUTPUT_COUNT << " elements: ";
+    //  for (int j = 0; j < DISPLAY_OUTPUT_COUNT; j++)
+    //  {
+    //    o << pData[j] << ' ';
+    //  }
+    //  std::cout << o.str() << '\n';
+
+    //  vmaUnmapMemory(gAllocator, outBufferHost.allocation);
+    //}
   }
 
   accumulatedTime /= NUM_ITERATIONS;
-  std::cout << std::format("Average time ({} iterations): {} * {} ns ({} ms)\n", NUM_ITERATIONS, gTimestampPeriod, accumulatedTime, ((double)gTimestampPeriod * accumulatedTime) / 1'000'000);
+  double meanTime = ((double)gTimestampPeriod * accumulatedTime) / 1'000'000;
+
+  double varianceMs = 0;
+  double sumMs = 0;
+  for (double elem : iterationTimes)
+  {
+    sumMs += elem;
+    varianceMs += (elem - meanTime) * (elem - meanTime);
+  }
+  varianceMs /= NUM_ITERATIONS - 1;
+  double meanMs = sumMs / NUM_ITERATIONS;
+
+  std::cout << std::format("Test: {}\n", test.shaderPath);
+  std::cout << std::format("Iterations: {}\n", NUM_ITERATIONS);
+  std::cout << std::format("Total time   (ms): {}\n", sumMs);
+  std::cout << std::format("Average time (ms): {}\n", meanTime);
+  std::cout << std::format("Variance     (ms): {}\n\n", (float)varianceMs);
+
+  vkDeviceWaitIdle(gDevice);
+
+  while (!localDeletionStack.empty())
+  {
+    auto& fn = localDeletionStack.top();
+    fn();
+    localDeletionStack.pop();
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{ TEST_DELAY_MS });
+}
+
+int main()
+{
+  Init();
+
+  std::cout << "-----Test info-----\n";
+  std::cout << std::format("Iteration delay (ms): {}\n", ITERATION_DELAY_MS);
+  std::cout << std::format("Test delay (ms): {}\n", TEST_DELAY_MS);
+  std::cout << std::format("Elements: {}\n\n", NUM_ELEMENTS);
+
+  // TODO: randomize the order of these tests?
+  DoTest({ "shaders/packed_vec3_std430.comp.spv", 3 });
+  DoTest({ "shaders/vec3_scalar.comp.spv", 3 });
+  DoTest({ "shaders/vec4_std430.comp.spv", 4 });
+  DoTest({ "shaders/vec3_std430.comp.spv", 4 });
   
   Deinit();
   return 0;
